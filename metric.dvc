@@ -1,6 +1,6 @@
 outs:
-- md5: 3391cb376b84f08971202c292ac03377.dir
-  size: 149513
-  nfiles: 8
+- md5: 847e3d4811dfafb9b0bce69ab865316b.dir
+  size: 1202604
+  nfiles: 28
   hash: md5
   path: metric
