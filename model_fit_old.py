@@ -2,36 +2,39 @@ import numpy as np
 import matplotlib
 import matplotlib.pyplot as plt
 import pandas as pd
-from skmap.overlay import SpaceOverlay, SpaceTimeOverlay
-from skmap.misc import find_files, GoogleSheet, ttprint
+from eumap.misc import find_files, ttprint, nan_percentile, GoogleSheet
+from eumap.raster import read_rasters, save_rasters
 import warnings
+import multiprocess as mp
+import time
 from scipy.special import expit, logit
 import warnings
-import os
-from scipy.stats import randint, uniform
 from sklearn.experimental import enable_halving_search_cv
-from sklearn.model_selection import train_test_split, HalvingGridSearchCV, KFold, GroupKFold, LeaveOneGroupOut
+from sklearn.model_selection import train_test_split, cross_val_score, HalvingGridSearchCV, KFold, GroupKFold
 from sklearn.model_selection import RandomizedSearchCV, HalvingRandomSearchCV, cross_val_predict
 from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error, mean_absolute_percentage_error, median_absolute_error
 from sklearn.ensemble import RandomForestRegressor
+from sklearn.pipeline import Pipeline
+from sklearn.neural_network import MLPRegressor
+from sklearn.inspection import permutation_importance
 import joblib
 import pickle
 from sklearn.metrics import r2_score, mean_squared_error, make_scorer
 from scipy.stats import pearsonr
 from sklearn.preprocessing import StandardScaler
+# from cubist import Cubist
+from sklearn.base import BaseEstimator, TransformerMixin
+from pathlib import Path
+import os
+from scipy.stats import randint, uniform
+# import mathtil
+from datetime import datetime
 import random
 import math
 import seaborn as sns
-# from cubist import Cubist
-# from sklearn.base import BaseEstimator, TransformerMixin
-# from pathlib import Path
-# import mathtil
-# from datetime import datetime
-# import time
-# from sklearn.neural_network import MLPRegressor
-# from sklearn.pipeline import Pipeline
-# from sklearn.inspection import permutation_importance
 
+# Prototype pipeline for global soil macrofauna mapping
+# Developed by OpenGeoHub team (Xuemeng Tian, Martijn Witjes, and Davide Consoli)
 
 def read_features(file_path):
     with open(file_path, 'r') as file:
@@ -83,9 +86,9 @@ def calc_metrics(y_true, y_pred, space):
         ccc = calc_ccc(y_true, y_pred)
         r2 = r2_score(y_true, y_pred)
         
-        # # report MAE and MAPE in original scale
-        # y_true = np.expm1(y_true)
-        # y_pred = np.expm1(y_pred)
+        # report MAE and MAPE in original scale
+        y_true = np.expm1(y_true)
+        y_pred = np.expm1(y_pred)
         rmse = np.sqrt(mean_squared_error(y_true, y_pred))
         mae = mean_absolute_error(y_true, y_pred)
         medae = median_absolute_error(y_true, y_pred)
@@ -94,9 +97,10 @@ def calc_metrics(y_true, y_pred, space):
     return rmse, mae, medae, mape, ccc, r2, bias
 
 
-def cfi_calc(data, tgt, prop, space, output_folder, date_str, covs_all):
+def cfi_calc(data, tgt, prop, space, output_folder, version, covs_all):
     data = data.dropna(subset=covs_all,how='any')
     n_bootstrap=20
+    ntrees = 100
     
     runs = []
     feature_importances = []
@@ -115,7 +119,7 @@ def cfi_calc(data, tgt, prop, space, output_folder, date_str, covs_all):
         )
         
         ttprint(f'{k} iteration, training size: {len(train)}')
-        rf = RandomForestRegressor(random_state=41, n_jobs=-1)
+        rf = RandomForestRegressor(random_state=41, n_jobs=80, n_estimators=ntrees)
         rf.fit(train[covs_all], train[tgt])
         
         # impurity-based feature importance
@@ -130,12 +134,12 @@ def cfi_calc(data, tgt, prop, space, output_folder, date_str, covs_all):
     sorted_importances = result.mean(axis=0).sort_values(ascending=False)
     sorted_importances = sorted_importances.reset_index()
     sorted_importances.columns = ['feature', 'cfi']
-    # date_str = datetime.today().strftime('%Y%m%d')
-    sorted_importances.to_csv(f'{output_folder}/feature_cfi_{prop}_v{date_str}.csv',index=False)
+    # version = datetime.today().strftime('%Y%m%d')
+    sorted_importances.to_csv(f'{output_folder}/feature_cfi_{prop}_{version}.csv',index=False)
     
     return sorted_importances
     
-def rscfi(data, tgt, prop, space, output_folder, date_str, covs_all, sorted_importances, threshold_num=[50,100], step_size=0.0002, strata_col = None):
+def rscfi(data, tgt, prop, space, output_folder, version, covs_all, sorted_importances, threshold_num=[50,100], step_size=0.0002):
     min_num, max_num = threshold_num
     max_threshold = sorted_importances['cfi'].max()
     min_threshold = sorted_importances['cfi'].min()
@@ -149,12 +153,9 @@ def rscfi(data, tgt, prop, space, output_folder, date_str, covs_all, sorted_impo
     data = data.dropna(subset=covs_all,how='any')
     
     n_splits = 5
-    if strata_col is not None:
-        groups = data[strata_col].values  # Create groups for stratification
-        kfold = GroupKFold(n_splits=n_splits)  # Use GroupKFold for stratified cross-validation
-    else:
-        kfold = KFold(n_splits=n_splits, shuffle=True, random_state=42)  # Regular KFold without stratification
-
+    ntrees = 100
+    spatial_cv_column='tile_id'
+    groups = data[spatial_cv_column].unique()
     
     for threshold in thresholds:
         current_features = sorted_importances.loc[sorted_importances['cfi'] >= threshold, 'feature'].tolist()
@@ -167,10 +168,11 @@ def rscfi(data, tgt, prop, space, output_folder, date_str, covs_all, sorted_impo
             break  # Stop if limited (<2) features are left
 
         ttprint(f'processing {threshold} ...')
-        rf = RandomForestRegressor(random_state=41, n_jobs=-1)
-        
+        rf = RandomForestRegressor(random_state=41, n_jobs=80, n_estimators=ntrees)
+        group_kfold = GroupKFold(n_splits=n_splits)
 
-        y_pred = cross_val_predict(rf, data[current_features], data[tgt], cv=kfold, groups=groups if strata_col else None, n_jobs=-1)
+        groups = data[spatial_cv_column].values
+        y_pred = cross_val_predict(rf, data[current_features], data[tgt], cv=group_kfold, groups=groups, n_jobs=-1)
         y_true = data[tgt]
 
         metrics = calc_metrics(y_true, y_pred, space)
@@ -181,22 +183,28 @@ def rscfi(data, tgt, prop, space, output_folder, date_str, covs_all, sorted_impo
     # results_df['MAE_Rank'] = results_df['MAE'].rank(ascending=True)
     results_df['RMSE_Rank'] = results_df['RMSE'].rank(ascending=True)
     # results_df['MedAE_Rank'] = results_df['MedAE'].rank(ascending=True)
-    results_df['bias_Rank'] = results_df['bias'].rank(ascending=True)
+    results_df['bias_Rank'] = results_df['bias'].abs().rank(ascending=True)
     results_df['CCC_Rank'] = results_df['CCC'].rank(ascending=False)
     # results_df['R2_Rank'] = results_df['R2'].rank(ascending=False)
     results_df['Combined_Rank'] = results_df['RMSE_Rank'] + results_df['CCC_Rank']# + results_df['bias_Rank']
     
     # select threshold
-    results_df = results_df.sort_values(by=['Combined_Rank', 'Num_Features'], ascending=[True, True])
-    # date_str = datetime.today().strftime('%Y%m%d')
-    results_df.to_csv(f'{output_folder}/feature_metrics.elimination_{prop}_v{date_str}.csv', index=False)
+    results_df = results_df.sort_values(by=['Combined_Rank', 'Num_Features'], ascending=[True, True]).reset_index(drop=True)
+    # version = datetime.today().strftime('%Y%m%d')
+    results_df.to_csv(f'{output_folder}/feature_metrics.elimination_{prop}_{version}.csv', index=False)
     
-    best_threshold = results_df['Threshold'].iloc[0]
     for index, row in results_df.iterrows():
+        if index == 0:
+            best_threshold = row['Threshold']
         if (row['Num_Features'] <= max_num) & (row['Num_Features'] >= min_num):
             selected_threshold = row['Threshold']
             break
-           
+    # Best combined rank
+    best_num_features = results_df.loc[results_df['Threshold'] == best_threshold, 'Num_Features'].values[0]
+    # results_df.loc[best_combined_rank_index, 'Num_Features']
+    selected_num_features = results_df.loc[results_df['Threshold'] == selected_threshold, 'Num_Features'].values[0]
+          
+    
     features_df = sorted_importances[sorted_importances['cfi'] >= selected_threshold]
     covs = features_df['feature'].tolist()
     
@@ -205,7 +213,7 @@ def rscfi(data, tgt, prop, space, output_folder, date_str, covs_all, sorted_impo
     #     covs.append('hzn_dep')
         
     print(f'**{len(covs)} features selected for {prop}, cfi threshold: {selected_threshold}**')
-    with open(f'{output_folder}/feature_selected_{prop}_v{date_str}.txt', 'w') as file:
+    with open(f'{output_folder}/feature_selected_{prop}_{version}.txt', 'w') as file:
         for item in covs:
             file.write(f"{item}\n")
         
@@ -236,12 +244,6 @@ def rscfi(data, tgt, prop, space, output_folder, date_str, covs_all, sorted_impo
     labels = [l.get_label() for l in lines]
     ax1.legend(lines, labels, loc='upper left', bbox_to_anchor=(0.15, 0.95), fontsize=14, framealpha=0.5)
 
-    # Best combined rank
-    best_combined_rank_index = results_df['Combined_Rank'].idxmin()
-    best_threshold = results_df.loc[best_combined_rank_index, 'Threshold']
-    best_num_features = results_df.loc[best_combined_rank_index, 'Num_Features']
-    selected_num_features = results_df.loc[results_df['Threshold'] == selected_threshold, 'Num_Features'].values[0]
-
     # Vertical line for the best and selected threshold
     ax1.axvline(x=best_threshold, color='grey', linestyle='--', label='Best Threshold')
     ax1.axvline(x=selected_threshold, color='cyan', linestyle='--', label='Selected Threshold')
@@ -254,25 +256,20 @@ def rscfi(data, tgt, prop, space, output_folder, date_str, covs_all, sorted_impo
     ax1.legend(lines, labels, loc='upper right', fontsize=14, framealpha=0.5)#, bbox_to_anchor=(0.15, 0.95)
 
     plt.title(f'{prop}\nbest feature number: {best_num_features}, select {selected_num_features}', fontsize=16)
-    plt.savefig(f'{output_folder}/feature_plot.elimination_{prop}_v{date_str}.pdf')
+    plt.savefig(f'{output_folder}/feature_plot.elimination_{prop}_{version}.pdf')
     plt.show()
     
     return covs
 
     
-def parameter_fine_tuning(cal, covs, tgt, prop, output_folder, version, strata_col):
+def parameter_fine_tuning(cal, covs, tgt, prop, output_folder, version):
     models = [] #[rf, ann, lgb, rf_weighted, lgb_weighted] #cubist, cubist_weighted, 
     model_names = [] #['rf', 'ann', 'lgb', 'rf_weighted', 'lgb_weighted'] # 'cubist',, 'cubist_weighted'
     cal = cal.dropna(subset=covs,how='any')
 
     ### parameter fine tuning
-    n_splits = 5
-    if strata_col is not None:
-        groups = data[strata_col].values  # Create groups for stratification
-        kfold = GroupKFold(n_splits=n_splits)  # Use GroupKFold for stratified cross-validation
-    else:
-        kfold = KFold(n_splits=n_splits, shuffle=True, random_state=42)  # Regular KFold without stratification
-        
+    spatial_cv_column = 'tile_id'
+    cv = GroupKFold(n_splits=5)
     ccc_scorer = make_scorer(calc_ccc, greater_is_better=True)
     fitting_score = ccc_scorer
     
@@ -280,7 +277,7 @@ def parameter_fine_tuning(cal, covs, tgt, prop, output_folder, version, strata_c
     # random forest
     ttprint('----------------------rf------------------------')
     param_rf = {
-        'n_estimators': [64],
+        'n_estimators': [80, 100, 120],
         "criterion": ['squared_error'], #['squared_error', 'absolute_error', 'poisson', 'friedman_mse'],
         'max_depth': [10, 20, 30],
         'max_features': [0.3, 0.5, 0.7, 'log2', 'sqrt'],
@@ -291,15 +288,15 @@ def parameter_fine_tuning(cal, covs, tgt, prop, output_folder, version, strata_c
         estimator=RandomForestRegressor(),
         param_grid=param_rf,
         scoring=fitting_score,
-        n_jobs=-1, 
-        cv=kfold,
+        n_jobs=90, 
+        cv=cv,
         verbose=1,
         random_state = 1992
     )
-    tune_rf.fit(cal[covs], cal[tgt], groups=groups if strata_col else None)
+    tune_rf.fit(cal[covs], cal[tgt], groups=cal[spatial_cv_column])
     warnings.filterwarnings('ignore')
     rf = tune_rf.best_estimator_
-    joblib.dump(rf, f'{output_folder}/model_rf.{prop}_ccc_v{version}.joblib')
+    joblib.dump(rf, f'{output_folder}/model_rf.{prop}_ccc_{version}.joblib')
     models.append(rf)
     model_names.append('rf')
     
@@ -329,7 +326,7 @@ def parameter_fine_tuning(cal, covs, tgt, prop, output_folder, version, strata_c
     #     estimator=pipeline,
     #     param_grid=param_lgb,
     #     scoring=fitting_score,
-    #     n_jobs=-1,
+    #     n_jobs=90,
     #     cv=cv,
     #     verbose=1,
     #     random_state=1994
@@ -349,78 +346,7 @@ cet_l19_cmap = LinearSegmentedColormap.from_list(
     "CET-L19", ["#abdda4", "#ffffbf", "#fdae61", "#d7191c"]
 )
 
-def accuracy_evaluation(model_file, tgt, train, test, strata_col, group_strategy, output_folder):
-    model = joblib.load(model_file)
-    model.n_jobs =-1
-    model_name = model_file.split('_')[-2].split('.')[0]
-    covs = model.feature_names_in_
-        
-    results = []
-
-    # cross validation------------------------------------------------------------
-    if strata_col:
-        for ii in range(len(strata_col)):
-            st_col = strata_col[ii]
-            st_stg = group_strategy[ii]
-            
-            ttprint(f'start CV grouped by {st_col} for {model_name}')
-            if st_col:
-                if st_stg == 'gkf':
-                    y_cv = cross_val_predict(model, train[covs], train[tgt], cv=GroupKFold(n_splits=5), groups=train[st_col])
-                elif st_stg == 'logo':
-                    logo = LeaveOneGroupOut()
-                    y_cv = cross_val_predict(model, train[covs], train[tgt], cv=logo.split(train[covs], train[tgt], train[st_col]))
-                elif st_stg == 'kf':
-                    y_cv = cross_val_predict(model, train[covs], train[tgt], cv=KFold(n_splits=5))
-            else:
-                y_cv = cross_val_predict(model, train[covs], train[tgt], cv=KFold(n_splits=5))
-            ttprint(f'finish!')
-            train[f'{tgt}_cv.{st_stg}.{st_col}_{model_name}'] = y_cv
-            
-            rmse, mae, medae, mape, ccc, r2, bias = accuracy_plot(train[tgt], train[f'{tgt}_cv.{st_stg}.{st_col}_{model_name}'], tgt, model_name, 'test', output_folder)
-            results.append({
-                'prop':tgt.split('_')[0],
-                'model': model_name,
-                'evaluation_type': f'cv.{st_stg}.{st_col}',
-                'RMSE': rmse,
-                'MAE': mae,
-                'MedAE': medae,
-                'MAPE': mape,
-                'R2': r2,
-                'CCC': ccc,
-                'bias': bias
-            })
-
-    # test---------------------------------------------------------------------------
-    ttprint(f'start test prediction for {model_name}')
-    model.fit(train[covs], train[tgt])
-    y_val = model.predict(test[covs])
-    ttprint(f'finish!')
-    test[f'{tgt}_test_{model_name}'] = y_val
-
-    rmse, mae, medae, mape, ccc, r2, bias = accuracy_plot(test[tgt], test[f'{tgt}_test_{model_name}'], tgt, model_name, 'test', output_folder)
-    results.append({
-        'prop':tgt.split('_')[0],
-        'model': model_name,
-        'evaluation_type': 'hold-out test',
-        'RMSE': rmse,
-        'MAE': mae,
-        'MedAE': medae,
-        'MAPE': mape,
-        'R2': r2,
-        'CCC': ccc,
-        'bias': bias
-    })
-    
-    return pd.DataFrame(results)
-
-def accuracy_plot(y_test, y_pred, tgt, mdl, test_type, output_folder):
-    prop = tgt.split('_')[0]
-    if len(tgt.split('_'))>1:
-        space = tgt.split('_')[-1]
-    else:
-        space = 'normal'
-        
+def accuracy_plot(y_test, y_pred, prop, space, mdl, test_type, output_folder):
     rmse, mae, medae, mape, ccc, r2, bias = calc_metrics(y_test, y_pred, space)
     
     show_range = [
@@ -431,12 +357,12 @@ def accuracy_plot(y_test, y_pred, tgt, mdl, test_type, output_folder):
     plt.rcParams.update({'font.size': 16})
     fig, ax = plt.subplots(figsize=(8, 7))
     
-    ax.set_title(f'{mdl}, {test_type}, using {len(y_test)} data\nRMSE={rmse:.2f}, CCC={ccc:.2f}, bias={bias:.2f}')
+    ax.set_title(f'{test_type} of {mdl} in {space} scale using {len(y_test)} data\nRMSE={rmse:.2f}, CCC={ccc:.2f}, bias={bias:.2f}')
     
     # Use the CET-L19 colorblind-friendly colormap
     hb = ax.hexbin(y_pred, y_test, gridsize=(20, 20), cmap=cet_l19_cmap, mincnt=2, vmax=vmax, bins='log')
-    ax.set_xlabel(f'Predicted {tgt}')
-    ax.set_ylabel(f'Observed {tgt}')
+    ax.set_xlabel(f'Predicted {prop}')
+    ax.set_ylabel(f'Observed {prop}')
     ax.set_aspect('auto', adjustable='box')
     ax.spines['top'].set_visible(False)
     ax.spines['right'].set_visible(False)
@@ -448,9 +374,8 @@ def accuracy_plot(y_test, y_pred, tgt, mdl, test_type, output_folder):
     cb.set_label('Count')
     
     plt.tight_layout(rect=[0, 0, 0.92, 1])  # Adjust the right margin to make room for colorbar
-    plt.savefig(f'{output_folder}/plot_accuracy.{tgt}_{mdl}.{test_type}.pdf', format='pdf', bbox_inches='tight', dpi=300)
+    plt.savefig(f'{output_folder}/plot_accuracy.{test_type}_{mdl}.{prop}.pdf', format='pdf', bbox_inches='tight', dpi=300)
     return rmse, mae, medae, mape, ccc, r2, bias
-
 
 def accuracy_strata_plot(metric, strata_df, prop, mdl):
 
@@ -491,15 +416,16 @@ def accuracy_strata_plot(metric, strata_df, prop, mdl):
 
 
 
-def separate_data(prop, space, output_folder, date_str, df, strata_col): 
+def separate_data(prop, space, output_folder, version, df, strata_col): 
     # df = pd.read_csv(f'/home/opengeohub/xuemeng/work_xuemeng/soc/data/002_data_whole.csv',low_memory=False) 
     os.makedirs(output_folder, exist_ok=True)
     
     ### data set preparation
     # clean the data according to each properties
     ini_len = len(df)
-    df = df.loc[df[prop].notna() & (df[prop+'_qa']>2)]
-    print(f'drop invalid {ini_len-len(df)} records')
+    if prop+'_qa' in df.columns:
+        df = df.loc[df[prop].notna() & (df[prop+'_qa']>2)]
+        print(f'drop invalid {ini_len-len(df)} records')
     # df[prop].hist(bins=40)
     
     # set target variable
@@ -509,7 +435,10 @@ def separate_data(prop, space, output_folder, date_str, df, strata_col):
     else:
         tgt = prop
        
-    df['strata'] = df[strata_col].astype(str).agg(','.join, axis=1)
+    if len(strata_col)>1:
+        df['strata'] = df[strata_col].astype(str).agg(','.join, axis=1)
+    else:
+        df['strata'] = df[strata_col[0]]
     strata_counts = df['strata'].value_counts()
 
     # Step 1: Separate small and large strata
@@ -560,7 +489,7 @@ def separate_data(prop, space, output_folder, date_str, df, strata_col):
     # Step 3: Split Large Strata Data into Training and Temporary (Test + Calibration)
     temp_large, test_large = train_test_split(
         large_strata_data,
-        test_size=min(0.1, 6000 / len(large_strata_data)),
+        test_size=min(0.1, 4000 / len(large_strata_data)),
         stratify=large_strata_data['strata'],
         random_state=42
     )
@@ -590,203 +519,14 @@ def separate_data(prop, space, output_folder, date_str, df, strata_col):
     print(f'sum {lsum}, df {len(df)}')
     
     # name with version
-    # date_str = datetime.today().strftime('%Y%m%d')
-    cal.to_parquet(f'{output_folder}/data_cal_{prop}_v{date_str}.pq')
-    train.to_parquet(f'{output_folder}/data_train_{prop}_v{date_str}.pq')
-    test.to_parquet(f'{output_folder}/data_test_{prop}_v{date_str}.pq')
+    # version = datetime.today().strftime('%Y%m%d')
+    cal.to_parquet(f'{output_folder}/data_cal_{prop}_{version}.pq')
+    train.to_parquet(f'{output_folder}/data_train_{prop}_{version}.pq')
+    test.to_parquet(f'{output_folder}/data_test_{prop}_{version}.pq')
     return cal, train, test
 
 
-
-        
-def textures_fw_transform(sand, silt, clay, k=1, a=100):
-    """
-    Forward transformation from sand, silt, and clay fractions to texture_1 and texture_2
-    using logarithm base 2.
-
-    Parameters:
-    - sand, silt, clay: Soil texture fractions (absolute values, not normalized)
-    - k: Small offset to avoid division by zero
-    - a: Normalization factor (typically 100)
-
-    Returns:
-    - texture_1, texture_2: Transformed soil texture values
-    """
-    texture_1 = np.log2((sand / a + k) / (clay / a + k))
-    texture_2 = np.log2((silt / a + k) / (clay / a + k))
-    
-    return texture_1, texture_2
-
-    
-def textures_bw_transform(texture_1, texture_2, k=1, a=100):
-    """
-    Backward transformation from texture_1 and texture_2 back to sand, silt, and clay fractions.
-
-    Parameters:
-    - texture_1, texture_2: Transformed soil texture values
-    - k: Small offset used in the forward transform
-    - a: Normalization factor (typically 100)
-
-    Returns:
-    - sand, silt, clay: Reconstructed soil texture fractions (absolute values)
-    """
-    # Invert log2 transformation
-    x1 = 2 ** texture_1
-    x2 = 2 ** texture_2
-
-    # Solve for clay fraction
-    C = (1 - (x1 + x2 - 2) * k) / (x1 + x2 + 1)
-
-    # Solve for sand and silt fractions
-    S = x1 * C + x1 * k - k
-    L = x2 * C + x2 * k - k
-
-    # Convert back to absolute values
-    sand = a * S
-    silt = a * L
-    clay = a * C
-
-    return sand, silt, clay
-
-from sklearn.utils.validation import check_is_fitted
-# import skmap_bindings as skb
-from joblib import Parallel, delayed
-import threading
-
-def _single_prediction(predict, X, out, i, lock):
-    prediction = predict(X, check_input=False)
-    with lock:
-        out[i, :] = prediction
-
-def cast_tree_rf(model):
-    model.__class__ = TreesRandomForestRegressor
-    return model
-
-class TreesRandomForestRegressor(RandomForestRegressor):
-    def predict(self, X):
-        """
-        Predict regression target for X.
-
-        The predicted regression target of an input sample is computed according
-        to a list of functions that receives the predicted regression targets of each 
-        single tree in the forest.
-
-        Parameters
-        ----------
-        X : {array-like, sparse matrix} of shape (n_samples, n_features)
-            The input samples. Internally, its dtype will be converted to
-            `dtype=np.float32. If a sparse matrix is provided, it will be
-            converted into a sparse `csr_matrix.
-
-        Returns
-        -------
-        s : an ndarray of shape (n_estimators, n_samples)
-            The predicted values for each single tree.
-        """
-        check_is_fitted(self)
-        # Check data
-        X = self._validate_X_predict(X)
-
-        # store the output of every estimator
-        assert(self.n_outputs_ == 1)
-        pred_t = np.empty((len(self.estimators_), X.shape[0]), dtype=np.float32)
-        # Assign chunk of trees to jobs
-        n_jobs = min(self.n_estimators, self.n_jobs)
-        # Parallel loop prediction
-        lock = threading.Lock()
-        Parallel(n_jobs=n_jobs, verbose=self.verbose, require="sharedmem")(
-            delayed(_single_prediction)(self.estimators_[i].predict, X, pred_t, i, lock)
-            for i in range(len(self.estimators_))
-        )
-        return pred_t
-
-    
-    import matplotlib.pyplot as plt
-    
-    
-def calc_picp(lower_bounds, upper_bounds, true_values):
-    within_bounds = np.sum((true_values >= lower_bounds) & (true_values <= upper_bounds))
-    picp = within_bounds / len(true_values)
-    return picp
-
-def calc_qcp(predictions, true_values, quantile):
-    return np.mean(true_values <= predictions)
-
-def uncertainty_evaluation(model_file, train, test, tgt,output_folder):
-    # read in material--------------------------------------------------------------
-    model = joblib.load(model_file)
-    model.n_jobs =-1
-    model_name = model_file.split('_')[-2].split('.')[0]
-    covs = model.feature_names_in_
-    
-    model.fit(train[covs], train[tgt])
-    model = cast_tree_rf(model)
-    
-    prop = tgt.split('_')[0]
-    if len(tgt.split('_'))>1:
-        space = tgt.split('_')[-1]
-    else:
-        space = 'normal'
-    
-    # tree predictions
-    tree_predictions = model.predict(test[covs])
-    y_pred = np.mean(tree_predictions, axis=0) # get the mean before transformation
-    y_pred = np.expm1(y_pred)
-    
-    # calculate quantiles to form an accuracy plots
-    if space == 'log1p':
-        tree_predictions = np.expm1(tree_predictions) # tranform before getting the percentile
-        
-    quantiles = [0.005, 0.025, 0.05, 0.1 , 0.15, 0.2 , 0.25, 0.3 , 0.35, 0.4 , 0.45, 0.495, 0.5 , 0.505, 0.55,
-                 0.6 , 0.65, 0.7 , 0.75, 0.8 , 0.85, 0.9 , 0.95, 0.975, 0.995]
-    y_q = np.percentile(tree_predictions, [q * 100 for q in quantiles], axis=0)
-    qcp = []
-    for ii in range(len(quantiles)):
-        qcp.append(calc_qcp(y_q[ii], test[prop], quantiles[ii]))
-
-    # calculate piw, picp
-    pi = []
-    picp = []
-    piw_m = []
-    piw_med = []
-    for ii in range(12):
-        jj = len(quantiles)-1-ii
-        pi.append(round(1-quantiles[ii]*2,2))
-        picp.append(calc_picp(y_q[ii,:], y_q[jj,:], test[prop]))
-        piw_m.append(np.mean(y_q[jj,:]-y_q[ii,:]))
-        piw_med.append(np.median(y_q[jj,:]-y_q[ii,:]))
-        
-    # calculate PICP for target PI (+- 1 std): 68%, P16-P84
-    target_pi = [0.16, 0.84]
-    pib = np.percentile(tree_predictions, [q * 100 for q in target_pi], axis=0)
-    target_picp = calc_picp(pib[0], pib[1], test[prop])
-
-    # plot
-    fig, axs = plt.subplots(1, 2, figsize=(12, 5), sharey=False)
-    fig.suptitle(f'Uncertainty Accuracy Plots {prop}', fontsize=20, y=1.05)  # y can be adjusted for spacing
-    axs[0].plot(quantiles, quantiles, label='1:1 line')
-    axs[0].scatter(quantiles, qcp, color='black')
-    axs[0].set_xlabel('Target quantiles', fontsize=20)
-    axs[0].set_ylabel('QCP', fontsize=20)
-    axs[0].grid(True)
-    axs[0].legend(fontsize=20, frameon=False)  # Make legend background transparent
-    axs[0].tick_params(axis='both', which='major', labelsize=20)
-
-    axs[1].axvline(x=0.68, color='orange', linestyle='--', linewidth=2, label=f'Target PI 68%:\nPICP {target_picp*100:.0f}%')  # Use axvline to draw a vertical line across the entire plot
-    axs[1].plot(pi, pi, label='1:1 line')
-    axs[1].scatter(pi, picp, color='black')
-    axs[1].set_xlabel('PI', fontsize=20)
-    axs[1].set_ylabel('PICP', fontsize=20)
-    axs[1].grid(True)
-    axs[1].legend(fontsize=20, frameon=False)  # Make legend background transparent
-    axs[1].tick_params(axis='both', which='major', labelsize=20)
-
-    plt.subplots_adjust(wspace=0.3)  
-    plt.savefig(f'{output_folder}/plot_acuracy.uncertainty_{prop}.pdf', format='pdf', dpi=300, bbox_inches='tight')
-    plt.show()
-
-    
-    
+import matplotlib.pyplot as plt
 def plot_top_features(prop, mdl, data_path, top_n=10):
     """
     Plots the top N features by importance in descending order.
@@ -937,6 +677,56 @@ def pdp_hexbin(df, prop, space, mdl, data_path, fn = 3, grid_resolution=50, bins
         plt.close()
         
         
+        
+def textures_fw_transform(sand, silt, clay, k=1, a=100):
+    """
+    Forward transformation from sand, silt, and clay fractions to texture_1 and texture_2
+    using logarithm base 2.
+
+    Parameters:
+    - sand, silt, clay: Soil texture fractions (absolute values, not normalized)
+    - k: Small offset to avoid division by zero
+    - a: Normalization factor (typically 100)
+
+    Returns:
+    - texture_1, texture_2: Transformed soil texture values
+    """
+    texture_1 = np.log2((sand / a + k) / (clay / a + k))
+    texture_2 = np.log2((silt / a + k) / (clay / a + k))
+    
+    return texture_1, texture_2
+
+    
+def textures_bw_transform(texture_1, texture_2, k=1, a=100):
+    """
+    Backward transformation from texture_1 and texture_2 back to sand, silt, and clay fractions.
+
+    Parameters:
+    - texture_1, texture_2: Transformed soil texture values
+    - k: Small offset used in the forward transform
+    - a: Normalization factor (typically 100)
+
+    Returns:
+    - sand, silt, clay: Reconstructed soil texture fractions (absolute values)
+    """
+    # Invert log2 transformation
+    x1 = 2 ** texture_1
+    x2 = 2 ** texture_2
+
+    # Solve for clay fraction
+    C = (1 - (x1 + x2 - 2) * k) / (x1 + x2 + 1)
+
+    # Solve for sand and silt fractions
+    S = x1 * C + x1 * k - k
+    L = x2 * C + x2 * k - k
+
+    # Convert back to absolute values
+    sand = a * S
+    silt = a * L
+    clay = a * C
+
+    return sand, silt, clay
+
 from scipy.spatial import distance_matrix
 
 def pairwise_var(gdft):
@@ -1006,12 +796,6 @@ def gaussian_model(h, nugget, sill, range_):
 def fit_variogram_model(model, h, gamma):
     # Initial guess for parameters: nugget, sill, range
     initial_params = [0.1, 1.0, 10.0]
-    
-    # Bounds: ([min_nugget, min_sill, min_range], [max_nugget, max_sill, max_range])
-    # You can tune the max values depending on your data
-    lower_bounds = [0.0, 0.0, 0.0001]  # nugget, sill, range ≥ 0
-    upper_bounds = [np.inf, np.inf, np.inf]
-
-    params, _ = curve_fit(model, h, gamma, p0=initial_params, bounds=(lower_bounds, upper_bounds))
+    params, _ = curve_fit(model, h, gamma, p0=initial_params)
     
     return params
