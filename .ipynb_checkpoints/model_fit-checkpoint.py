@@ -94,7 +94,7 @@ def calc_metrics(y_true, y_pred, space):
     return rmse, mae, medae, mape, ccc, r2, bias
 
 
-def cfi_calc(data, tgt, prop, space, output_folder, date_str, covs_all):
+def cfi_calc(data, tgt, prop, space, output_folder, version, covs_all):
     data = data.dropna(subset=covs_all,how='any')
     n_bootstrap=20
     
@@ -131,11 +131,11 @@ def cfi_calc(data, tgt, prop, space, output_folder, date_str, covs_all):
     sorted_importances = sorted_importances.reset_index()
     sorted_importances.columns = ['feature', 'cfi']
     # date_str = datetime.today().strftime('%Y%m%d')
-    sorted_importances.to_csv(f'{output_folder}/feature_cfi_{prop}_v{date_str}.csv',index=False)
+    sorted_importances.to_csv(f'{output_folder}/feature_cfi_{prop}_{version}.csv',index=False)
     
     return sorted_importances
     
-def rscfi(data, tgt, prop, space, output_folder, date_str, covs_all, sorted_importances, threshold_num=[50,100], step_size=0.0002, strata_col = None):
+def rscfi(data, tgt, prop, space, output_folder, version, covs_all, sorted_importances, threshold_num=[50,100], step_size=0.0002, strata_col = None):
     min_num, max_num = threshold_num
     max_threshold = sorted_importances['cfi'].max()
     min_threshold = sorted_importances['cfi'].min()
@@ -189,7 +189,7 @@ def rscfi(data, tgt, prop, space, output_folder, date_str, covs_all, sorted_impo
     # select threshold
     results_df = results_df.sort_values(by=['Combined_Rank', 'Num_Features'], ascending=[True, True])
     # date_str = datetime.today().strftime('%Y%m%d')
-    results_df.to_csv(f'{output_folder}/feature_metrics.elimination_{prop}_v{date_str}.csv', index=False)
+    results_df.to_csv(f'{output_folder}/feature_metrics.elimination_{prop}_{version}.csv', index=False)
     
     best_threshold = results_df['Threshold'].iloc[0]
     for index, row in results_df.iterrows():
@@ -205,7 +205,7 @@ def rscfi(data, tgt, prop, space, output_folder, date_str, covs_all, sorted_impo
     #     covs.append('hzn_dep')
         
     print(f'**{len(covs)} features selected for {prop}, cfi threshold: {selected_threshold}**')
-    with open(f'{output_folder}/feature_selected_{prop}_v{date_str}.txt', 'w') as file:
+    with open(f'{output_folder}/feature_selected_{prop}_{version}.txt', 'w') as file:
         for item in covs:
             file.write(f"{item}\n")
         
@@ -254,7 +254,7 @@ def rscfi(data, tgt, prop, space, output_folder, date_str, covs_all, sorted_impo
     ax1.legend(lines, labels, loc='upper right', fontsize=14, framealpha=0.5)#, bbox_to_anchor=(0.15, 0.95)
 
     plt.title(f'{prop}\nbest feature number: {best_num_features}, select {selected_num_features}', fontsize=16)
-    plt.savefig(f'{output_folder}/feature_plot.elimination_{prop}_v{date_str}.pdf')
+    plt.savefig(f'{output_folder}/feature_plot.elimination_{prop}_{version}.pdf')
     plt.show()
     
     return covs
@@ -299,7 +299,7 @@ def parameter_fine_tuning(cal, covs, tgt, prop, output_folder, version, strata_c
     tune_rf.fit(cal[covs], cal[tgt], groups=groups if strata_col else None)
     warnings.filterwarnings('ignore')
     rf = tune_rf.best_estimator_
-    joblib.dump(rf, f'{output_folder}/model_rf.{prop}_ccc_v{version}.joblib')
+    joblib.dump(rf, f'{output_folder}/model_rf.{prop}_ccc_{version}.joblib')
     models.append(rf)
     model_names.append('rf')
     
@@ -491,7 +491,7 @@ def accuracy_strata_plot(metric, strata_df, prop, mdl):
 
 
 
-def separate_data(prop, space, output_folder, date_str, df, strata_col): 
+def separate_data(prop, space, output_folder, version, df, strata_col): 
     # df = pd.read_csv(f'/home/opengeohub/xuemeng/work_xuemeng/soc/data/002_data_whole.csv',low_memory=False) 
     os.makedirs(output_folder, exist_ok=True)
     
@@ -591,9 +591,9 @@ def separate_data(prop, space, output_folder, date_str, df, strata_col):
     
     # name with version
     # date_str = datetime.today().strftime('%Y%m%d')
-    cal.to_parquet(f'{output_folder}/data_cal_{prop}_v{date_str}.pq')
-    train.to_parquet(f'{output_folder}/data_train_{prop}_v{date_str}.pq')
-    test.to_parquet(f'{output_folder}/data_test_{prop}_v{date_str}.pq')
+    cal.to_parquet(f'{output_folder}/data_cal_{prop}_{version}.pq')
+    train.to_parquet(f'{output_folder}/data_train_{prop}_{version}.pq')
+    test.to_parquet(f'{output_folder}/data_test_{prop}_{version}.pq')
     return cal, train, test
 
 
