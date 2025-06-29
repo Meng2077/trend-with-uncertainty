@@ -4,3 +4,4 @@
 /figure
 /tmp
 .ipynb_checkpoints/
+*.csv
