@@ -1,6 +1,6 @@
 outs:
-- md5: d1c7d7b81f4d5d7bcc4319b2715411d4.dir
-  size: 3541530943
-  nfiles: 115
+- md5: 9ede97ccc5717bc42ea08a0dff0cc1a4.dir
+  size: 3541432639
+  nfiles: 109
   hash: md5
   path: material
